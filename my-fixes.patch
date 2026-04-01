@@ -1,0 +1,264 @@
+diff --git a/editor.js b/editor.js
+index 549c8c5..f66264f 100644
+--- a/editor.js
++++ b/editor.js
+@@ -256,7 +256,7 @@
+     var serverOk = false;
+ 
+     try {
+-      var res = await fetch('/api/editor/config');
++      var res = await fetch('/api/editor/config', { cache: 'no-store' });
+       if (!res.ok) throw new Error('No config');
+       serverConfig = await res.json();
+       serverOk = true;
+diff --git a/server.js b/server.js
+index 75e2833..6b5e1da 100644
+--- a/server.js
++++ b/server.js
+@@ -1,3 +1,7 @@
++// ═══════════════════════════════════════
++// dotenv MUST be loaded first — before any process.env usage
++require('dotenv').config();
++
+ // ═══════════════════════════════════════
+ // Simple file logger for Railway or other hosts without visible console logs
+ function logToFile(msg) {
+@@ -104,14 +108,12 @@ setInterval(deliverPurchases, 20000); // кожні 20 секунд
+ // Tebex Purchases Webhook & API
+ // ═══════════════════════════════════════
+ 
+-require('dotenv').config();
+ // ── Proxy /api/command to Minecraft WebServer with X-API-Key ──
+ // (Оголошення та використання перенесено після ініціалізації app)
+ // ═══════════════════════════════════════
+ // Tebex Purchases Webhook & API
+ // ═══════════════════════════════════════
+ 
+-require('dotenv').config();
+ const path = require('path');
+ const express = require('express');
+ const crypto = require('crypto');
+@@ -428,6 +430,7 @@ function savePurchases() {
+ app.use('/api/build', express.json());
+ app.use('/api/editor', express.json({ limit: '1mb' }));
+ app.use('/api/maps', express.json({ limit: '50mb' }));
++app.use('/api/npc', express.json({ limit: '2mb' }));
+ app.use('/api/admins', express.json());
+ 
+ // Tebex webhook endpoint (має бути ДО static!)
+@@ -1033,7 +1036,7 @@ app.get('/api/admins/me', async (req, res) => {
+   const email = await verifyFirebaseToken(req);
+   if (!email) return res.status(401).json({ error: 'Not authenticated' });
+   if (email.toLowerCase() === OWNER_EMAIL.toLowerCase()) {
+-    return res.json({ isOwner: true, permissions: { minecraft: true, editor: true, checks_all: true } });
++    return res.json({ isOwner: true, permissions: { minecraft: true, editor: true, checks_all: true, npc_shop: true } });
+   }
+   const admin = adminsData.admins.find(a => a.email.toLowerCase() === email.toLowerCase());
+   if (admin) {
+@@ -1067,7 +1070,7 @@ app.post('/api/admins', async (req, res) => {
+   } else {
+     adminsData.admins.push({
+       email: adminEmail.toLowerCase(),
+-      permissions: permissions || { minecraft: false, editor: false, checks_all: false },
++      permissions: permissions || { minecraft: false, editor: false, checks_all: false, npc_shop: false },
+       addedAt: new Date().toISOString(),
+       addedBy: email
+     });
+@@ -1282,6 +1285,179 @@ app.get('/api/data/status', (req, res) => {
+ });
+ 
+ 
++
++// ═══════════════════════════════════════
++// NPC API (Custom NPCs with GUI Shops)
++// ═══════════════════════════════════════
++const NPCS_DIR = path.join(DATA_DIR, 'npcs');
++if (!fs.existsSync(NPCS_DIR)) fs.mkdirSync(NPCS_DIR, { recursive: true });
++
++// Helper: read single NPC
++function readNpc(name) {
++  const file = path.join(NPCS_DIR, name + '.json');
++  if (!fs.existsSync(file)) return null;
++  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch (e) { return null; }
++}
++
++// Helper: write single NPC
++function writeNpc(name, data) {
++  const file = path.join(NPCS_DIR, name + '.json');
++  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8');
++}
++
++// Helper: list all NPCs
++function listNpcs() {
++  if (!fs.existsSync(NPCS_DIR)) return [];
++  return fs.readdirSync(NPCS_DIR)
++    .filter(f => f.endsWith('.json'))
++    .map(f => {
++      try { return JSON.parse(fs.readFileSync(path.join(NPCS_DIR, f), 'utf-8')); }
++      catch (e) { return null; }
++    })
++    .filter(Boolean);
++}
++
++// Helper: push NPC to Minecraft plugin
++async function pushNpcToPlugin(npcData) {
++  try {
++    const res = await fetch(MC_BASE_URL + '/api/npc/save', {
++      method: 'POST',
++      headers: { 'X-API-Key': MC_API_KEY, 'Content-Type': 'application/json' },
++      body: JSON.stringify(npcData),
++      signal: AbortSignal.timeout(5000)
++    });
++    return res.ok;
++  } catch (e) {
++    console.log('[NPC] Push to plugin failed (server may be offline):', e.message);
++    return false;
++  }
++}
++
++// GET /api/npc — list all NPCs
++app.get('/api/npc', async (req, res) => {
++  const email = await verifyFirebaseToken(req);
++  if (!email) return res.status(401).json({ error: 'Not authenticated' });
++  if (!hasPermission(email, 'npc_shop')) return res.status(403).json({ error: 'Admin only' });
++  res.json(listNpcs());
++});
++
++// POST /api/npc — save NPC (also pushes to plugin)
++app.post('/api/npc', async (req, res) => {
++  const email = await verifyFirebaseToken(req);
++  if (!email) return res.status(401).json({ error: 'Not authenticated' });
++  if (!hasPermission(email, 'npc_shop')) return res.status(403).json({ error: 'Admin only' });
++
++  const data = req.body;
++  if (!data || !data.name) return res.status(400).json({ error: 'NPC name is required' });
++  if (!/^[a-zA-Z0-9_-]+$/.test(data.name)) return res.status(400).json({ error: 'Name: only a-z, 0-9, -, _' });
++
++  data.savedAt = new Date().toISOString();
++  writeNpc(data.name, data);
++  console.log('[NPC] Saved:', data.name);
++
++  // Push to Minecraft plugin (async, don't block response)
++  const pluginOk = await pushNpcToPlugin(data);
++
++  res.json({ success: true, name: data.name, pluginSynced: pluginOk });
++});
++
++// GET /api/npc/:name — get single NPC
++app.get('/api/npc/:name', async (req, res) => {
++  const email = await verifyFirebaseToken(req);
++  if (!email) return res.status(401).json({ error: 'Not authenticated' });
++  if (!hasPermission(email, 'npc_shop')) return res.status(403).json({ error: 'Admin only' });
++
++  const npc = readNpc(req.params.name);
++  if (!npc) return res.status(404).json({ error: 'NPC not found' });
++  res.json(npc);
++});
++
++// DELETE /api/npc/:name — delete NPC (also deletes from plugin)
++app.delete('/api/npc/:name', async (req, res) => {
++  const email = await verifyFirebaseToken(req);
++  if (!email) return res.status(401).json({ error: 'Not authenticated' });
++  if (!hasPermission(email, 'npc_shop')) return res.status(403).json({ error: 'Admin only' });
++
++  const name = req.params.name;
++  const file = path.join(NPCS_DIR, name + '.json');
++  if (!fs.existsSync(file)) return res.status(404).json({ error: 'NPC not found' });
++
++  fs.unlinkSync(file);
++  console.log('[NPC] Deleted from website:', name);
++
++  // Also delete from plugin
++  let pluginDeleted = false;
++  try {
++    const pluginRes = await fetch(MC_BASE_URL + '/api/npc/delete-file', {
++      method: 'POST',
++      headers: { 'X-API-Key': MC_API_KEY, 'Content-Type': 'application/json' },
++      body: JSON.stringify({ name }),
++      signal: AbortSignal.timeout(5000)
++    });
++    pluginDeleted = pluginRes.ok;
++  } catch (e) {
++    console.log('[NPC] Plugin delete failed:', e.message);
++  }
++
++  res.json({ success: true, pluginDeleted });
++});
++
++// POST /api/npc/sync — sync NPCs between website and plugin
++app.post('/api/npc/sync', async (req, res) => {
++  const email = await verifyFirebaseToken(req);
++  if (!email) return res.status(401).json({ error: 'Not authenticated' });
++  if (!hasPermission(email, 'npc_shop')) return res.status(403).json({ error: 'Admin only' });
++
++  let pulled = 0, pushed = 0;
++  let pluginError = null;
++
++  try {
++    // 1. Pull NPCs from plugin
++    const pluginRes = await fetch(MC_BASE_URL + '/api/npc/list', {
++      headers: { 'X-API-Key': MC_API_KEY },
++      signal: AbortSignal.timeout(8000)
++    });
++
++    if (pluginRes.ok) {
++      const pluginNpcs = await pluginRes.json();
++
++      if (Array.isArray(pluginNpcs)) {
++        const websiteNames = new Set(fs.readdirSync(NPCS_DIR).filter(f => f.endsWith('.json')).map(f => f.replace('.json', '')));
++
++        // Pull: NPCs in plugin but not on website
++        for (const pnpc of pluginNpcs) {
++          const name = pnpc.name;
++          if (!name) continue;
++          if (!websiteNames.has(name)) {
++            writeNpc(name, pnpc);
++            pulled++;
++            console.log('[NPC Sync] Pulled from plugin:', name);
++          }
++        }
++
++        // Push: NPCs on website but not in plugin
++        const pluginNames = new Set(pluginNpcs.map(n => n.name).filter(Boolean));
++        const allWebsiteNpcs = listNpcs();
++        for (const wnpc of allWebsiteNpcs) {
++          if (!pluginNames.has(wnpc.name)) {
++            const ok = await pushNpcToPlugin(wnpc);
++            if (ok) pushed++;
++            console.log('[NPC Sync] Pushed to plugin:', wnpc.name, ok ? 'ok' : 'failed');
++          }
++        }
++      }
++    } else {
++      pluginError = 'Plugin returned HTTP ' + pluginRes.status;
++    }
++  } catch (e) {
++    pluginError = e.message;
++    console.log('[NPC Sync] Error:', e.message);
++  }
++
++  const total = listNpcs().length;
++  res.json({ success: true, pulled, pushed, total, pluginError });
++});
++
+ // Proxy /api/* (except handled routes) to Minecraft server plugin
+ app.use('/api', createProxyMiddleware({
+   target: 'http://fra14.joinserver.xyz:25712',
+@@ -1294,7 +1470,16 @@ app.use('/api', createProxyMiddleware({
+ }));
+ 
+ // Serve static files
+-app.use(express.static(path.join(__dirname)));
++// HTML files get no-cache headers so browsers always fetch fresh content after deploy
++app.use(express.static(path.join(__dirname), {
++  setHeaders: (res, filePath) => {
++    if (filePath.endsWith('.html')) {
++      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
++      res.setHeader('Pragma', 'no-cache');
++      res.setHeader('Expires', '0');
++    }
++  }
++}));
+ 
+ // Fallback to index.html
+ app.get('*', (req, res) => {
